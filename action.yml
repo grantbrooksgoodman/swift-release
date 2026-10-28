@@ -28,17 +28,34 @@ runs:
     - name: Find previous version
       id: prev
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
+        prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+        # Retire versions whose commits were rewritten away (squash, rebase, force push):
+        # every v* tag above the nearest reachable one whose commit is no longer an ancestor of HEAD.
+        floor=""
+        for t in $(git tag -l 'v[0-9]*' | sort -V); do
+          git merge-base --is-ancestor "$t" HEAD && continue
+          if [ -n "$prev" ] && [ "$(printf '%s\n%s\n' "$prev" "$t" | sort -V | tail -n1)" = "$prev" ]; then
+            continue  # older than the surviving history; leave it alone
+          fi
+          echo "Retiring $t: its commit is no longer on this branch."
+          gh release delete "$t" --yes --cleanup-tag || git push origin --delete "$t"
+          git tag -d "$t" >/dev/null
+          floor="$t"
+        done
+        echo "floor=$floor" >> "$GITHUB_OUTPUT"
         if git describe --tags --exact-match --match 'v[0-9]*' HEAD >/dev/null 2>&1; then
           echo "HEAD is already tagged; nothing to do."
           echo "state=tagged" >> "$GITHUB_OUTPUT"
-        elif tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null); then
-          echo "Previous version: $tag"
+        elif [ -n "$prev" ]; then
+          echo "Previous version: $prev"
           echo "state=bump" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag=$prev" >> "$GITHUB_OUTPUT"
         else
-          echo "No v* tag yet; will seed v${{ inputs.initial-version }}."
+          echo "No v* tag reachable from HEAD; will seed."
           echo "state=seed" >> "$GITHUB_OUTPUT"
         fi
 
@@ -49,6 +66,7 @@ runs:
       env:
         SCRIPTS: ${{ github.action_path }}/scripts
         PREV: ${{ steps.prev.outputs.tag }}
+        FLOOR: ${{ steps.prev.outputs.floor }}
         SOURCE_PATHS: ${{ inputs.source-paths }}
       run: |
         set -euo pipefail
@@ -69,7 +87,7 @@ runs:
         fi
         messages=$(git log --format=%B "$PREV"..HEAD)
         python3 -I "$SCRIPTS/decide_bump.py" \
-          --prev "$PREV" --removed "$removed" --added "$added" \
+          --prev "$PREV" --floor "$FLOOR" --removed "$removed" --added "$added" \
           --lines "$lines" --platform-changed "$platform" --messages "$messages" \
           | tee -a "$GITHUB_OUTPUT"
         {
@@ -101,13 +119,18 @@ runs:
         gh release create "$NEW" --verify-tag --title "$NEW" --generate-notes --notes-file "$RUNNER_TEMP/release/release_notes.md"
 
     - name: Seed first version
+      id: seed
       if: steps.prev.outputs.state == 'seed'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
-        NEW: v${{ inputs.initial-version }}
+        SCRIPTS: ${{ github.action_path }}/scripts
+        INITIAL: ${{ inputs.initial-version }}
+        FLOOR: ${{ steps.prev.outputs.floor }}
       run: |
         set -euo pipefail
+        python3 -I "$SCRIPTS/decide_bump.py" --seed "$INITIAL" --floor "$FLOOR" | tee -a "$GITHUB_OUTPUT"
+        NEW="v$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -n1)"
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git tag -a "$NEW" -m "$NEW (initial version)"
@@ -121,10 +144,10 @@ runs:
         STATE: ${{ steps.prev.outputs.state }}
         BUMP: ${{ steps.bump.outputs.bump }}
         VERSION: ${{ steps.bump.outputs.version }}
-        INITIAL: ${{ inputs.initial-version }}
+        SEEDED: ${{ steps.seed.outputs.version }}
       run: |
         case "$STATE" in
-          seed)   echo "bump=seed" >> "$GITHUB_OUTPUT"; echo "version=$INITIAL" >> "$GITHUB_OUTPUT" ;;
+          seed)   echo "bump=seed" >> "$GITHUB_OUTPUT"; echo "version=$SEEDED" >> "$GITHUB_OUTPUT" ;;
           tagged) echo "bump=tagged" >> "$GITHUB_OUTPUT"; echo "version=" >> "$GITHUB_OUTPUT" ;;
-          *)      echo "bump=$BUMP" >> "$GITHUB_OUTPUT"; if [ "$BUMP" = none ]; then echo "version=" >> "$GITHUB_OUTPUT"; else echo "version=$VERSION" >> "$GITHUB_OUTPUT"; fi ;;
+          *)      echo "bump=$BUMP" >> "$GITHUB_OUTPUT"; echo "version=$VERSION" >> "$GITHUB_OUTPUT" ;;
         esac

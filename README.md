@@ -58,6 +58,22 @@ clause) or on an attribute change inside a closure type. When that happens,
 put `[patch]` or `[minor]` in the commit message, or delete the tag and release
 and re-run. It never silently under-reports a removed `public` symbol.
 
+## History rewrites
+
+Squashing, rebasing or force-pushing the default branch is fine. On the next
+run, every version whose commit is no longer on the branch is **retired**: its
+GitHub release and tag are deleted. The rewritten head then gets a fresh version
+computed from the last surviving tag, raised if necessary so that it is higher
+than every retired version. Numbers therefore never go backwards and are never
+reused, but gaps can appear (for example `v31.0.0`, `v31.0.3`).
+
+A commit-push-squash-force-push habit produces two runs a few seconds apart:
+the first tags the pre-squash commit, the second retires that tag and mints
+the squashed commit. The end state is one version on the branch head.
+
+If a consumer had already resolved a retired version, run package resolution
+again; the tag is gone.
+
 ## Inputs
 
 | Input | Required | Default | Purpose |
