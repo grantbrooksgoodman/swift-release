@@ -68,7 +68,7 @@ runs:
           echo "Retiring $tag: its commit is no longer on this branch."
           gh release delete "$tag" --yes --cleanup-tag \
             || git push origin --delete "$tag"
-          git tag -d "$tag" >/dev/null
+          git tag -d "$tag" >/dev/null 2>&1 || true
           floor="$tag"
         done
 
