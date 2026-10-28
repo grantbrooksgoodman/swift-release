@@ -1,15 +1,36 @@
 # swift-release
 
-A composite GitHub Action that turns every push to a Swift package's default
-branch into a semantic-version tag plus a GitHub release. The bump is derived
-from the package's **public API diff** since the previous tag, so the version
-number says something about compatibility rather than about effort.
+Mints a semantic version tag and a GitHub release for every
+push to a Swift package's default branch.
 
-## Use it from a package repository
+## Overview
+
+Use `swift-release` to version a Swift package without editing
+version numbers by hand. The action compares the package's
+public API with the API at the previous tag and derives the
+bump from the difference, so a version number describes
+compatibility rather than effort.
+
+The action is designed for GitHub's `ubuntu-latest` runner,
+which provides the `git`, `gh`, and `python3` tools that it
+uses. It does not require a Swift toolchain.
+
+## Adding the workflow
 
 Add `.github/workflows/release.yml` to the package:
 
 ```yaml
+#
+#  release.yml
+#
+#  Created by Grant Brooks Goodman.
+#  Copyright © NEOTechnica Corporation. All rights reserved.
+#
+
+# Mints a semantic version tag and a GitHub release for every
+# push to a Swift package's default branch. The rules are
+# documented at https://github.com/grantbrooksgoodman/swift-release.
+
 name: Release
 
 on:
@@ -20,8 +41,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: release
   cancel-in-progress: false
+  group: release
 
 jobs:
   release:
@@ -33,67 +54,89 @@ jobs:
           fetch-tags: true
       - uses: grantbrooksgoodman/swift-release@main
         with:
-          initial-version: "1.0.0"   # tagged as-is on the first run; bumps start on the next push
+          initial-version: "1.0.0"
 ```
 
-The first push with the workflow in place tags `HEAD` with `initial-version`.
-Every later push compares `HEAD` with the newest `v*` tag reachable from it and
-mints the next version. Pushes that land on an already-tagged commit do nothing.
+The first push with the workflow in place tags the pushed
+commit with `initial-version`. Every later push compares the
+pushed commit with the newest version tag reachable from it and
+mints the next version. A push that lands on an already tagged
+commit does nothing.
 
-## Rules, in order of precedence
+## How the bump is chosen
 
-1. **Explicit token** anywhere in a commit message of the push:
-   `[major]`, `[minor]`, `[patch]`, or `[skip release]` (skip folds the push into the next release).
-2. **Public API diff** (`public`/`open` declarations, including members of
-   `public extension`s and cases of public enums):
-   removed or changed symbols → **major**; added symbols → **minor**.
-   Adding a parameter *with a default value* to an existing function counts as **minor**.
-3. **Package.swift** change to `swift-tools-version` or a platform minimum → **major**.
-4. No API change but ≥ 1,000 changed lines in the sources → **minor** (SemVer §7 "may").
-5. Otherwise → **patch**.
+The action applies the first rule that matches:
 
-The API extractor is a lightweight text-level approximation, not the compiler.
-It can over-report on pure reformatting (for example a reordered generic
-clause) or on an attribute change inside a closure type. When that happens,
-put `[patch]` or `[minor]` in the commit message, or delete the tag and release
-and re-run. It never silently under-reports a removed `public` symbol.
+1. An explicit token in any commit message of the push –
+   `[major]`, `[minor]`, `[patch]`, or `[skip release]` – sets
+   the bump directly. `[skip release]` folds the push into the
+   next release.
+2. A removed or changed `public` or `open` declaration bumps
+   the major version. Members of `public` extensions,
+   requirements of `public` protocols, and cases of `public`
+   enums are part of the public API.
+3. A change to `swift-tools-version` or to a platform minimum
+   in `Package.swift` bumps the major version.
+4. An added `public` or `open` declaration bumps the minor
+   version. Adding a parameter that has a default value to an
+   existing function counts as an addition.
+5. A change of 1,000 or more lines in the source paths and
+   `Package.swift`, with no change to the public API, bumps the
+   minor version.
+6. Any other change bumps the patch version.
+
+> Important: The action reads declarations textually rather
+> than compiling the package. Reformatting a declaration, or
+> changing an attribute inside a closure type, can register as
+> a removal. Add `[patch]` or `[minor]` to the commit message
+> to override the result, or delete the tag and the release and
+> run the workflow again.
 
 ## History rewrites
 
-Squashing, rebasing or force-pushing the default branch is fine. On the next
-run, every version whose commit is no longer on the branch is **retired**: its
-GitHub release and tag are deleted. The rewritten head then gets a fresh version
-computed from the last surviving tag, raised if necessary so that it is higher
-than every retired version. Numbers therefore never go backwards and are never
-reused, but gaps can appear (for example `v31.0.0`, `v31.0.3`).
+Squashing, rebasing, or force-pushing the default branch is
+supported. On the next run, every version whose commit is no
+longer on the branch is retired: its GitHub release and tag are
+deleted. The rewritten head then receives a fresh version that
+is higher than every retired version, so numbers never go
+backwards and are never reused. Gaps can appear, for example
+`v31.0.0` followed by `v31.0.3`.
 
-A commit-push-squash-force-push habit produces two runs a few seconds apart:
-the first tags the pre-squash commit, the second retires that tag and mints
-the squashed commit. The end state is one version on the branch head.
+A commit, push, squash, and force-push sequence triggers two
+runs. Any version that the first run mints on the commit before
+the squash is retired by the second run, which mints the
+squashed commit.
 
-If a consumer had already resolved a retired version, run package resolution
-again; the tag is gone.
+> Note: If a consumer has already resolved a retired version,
+> run package resolution again.
 
 ## Inputs
 
-| Input | Required | Default | Purpose |
+| Input | Required | Default | Description |
 |---|---|---|---|
-| `initial-version` | yes | — | Version to tag when no `v*` tag exists yet |
-| `source-paths` | no | `Sources` | Space-separated paths holding the Swift sources |
-| `token` | no | `github.token` | Token with `contents: write` |
+| `initial-version` | Yes | – | The version to tag, without a bump, when the repository has no version tag yet. |
+| `source-paths` | No | `Sources` | The space-separated paths that hold the package's Swift sources. |
+| `token` | No | `github.token` | A token with write access to the repository's contents. |
 
 ## Outputs
 
-`bump` (`major`/`minor`/`patch`/`none`/`seed`/`tagged`) and `version` (no `v` prefix).
+| Output | Description |
+|---|---|
+| `bump` | The bump that was applied: `major`, `minor`, `patch`, `none`, `seed`, or `tagged`. |
+| `version` | The version that was tagged, without the `v` prefix, or an empty string when nothing was tagged. |
 
-## Layout
+## Files
 
-```
-action.yml             the composite action
-scripts/public_api.py  dumps the public API surface of a git revision
-scripts/api_diff.py    diffs two dumps, recognising defaulted-parameter extensions
-scripts/decide_bump.py applies the rules above and prints bump= / version=
-```
+| File | Purpose |
+|---|---|
+| `action.yml` | The composite action. |
+| `scripts/api_diff.py` | Compares two API listings and reports removed, added, and extended declarations. |
+| `scripts/decide_bump.py` | Applies the rules above and prints the bump and the next version. |
+| `scripts/public_api.py` | Prints the public API listing of a package at a git revision. |
+| `scripts/swift_declarations.py` | Scans Swift source text for declarations. |
+| `scripts/swift_lexing.py` | Removes comments and string literals from Swift source text. |
+| `scripts/swift_signatures.py` | Normalizes declaration signatures. |
 
-Everything runs on `ubuntu-latest` with the preinstalled `python3`, `git` and `gh`.
-No Swift toolchain is required.
+---
+
+&copy; NEOTechnica Corporation. All rights reserved.

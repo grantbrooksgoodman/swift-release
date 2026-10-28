@@ -1,26 +1,41 @@
+#
+#  action.yml
+#
+#  Created by Grant Brooks Goodman.
+#  Copyright © NEOTechnica Corporation. All rights reserved.
+#
+
 name: Swift package release
 description: >-
-  Mint a semantic-version tag and a GitHub release for a push to the default
-  branch. The bump is decided from the package's public API diff since the
-  previous tag (see README.md for the rules and the override tokens).
+  Mints a semantic version tag and a GitHub release for every
+  push to a Swift package's default branch. The bump is derived
+  from the package's public API diff since the previous tag.
 inputs:
   initial-version:
-    description: Version to tag as-is (no bump) when the repository has no v* tag yet.
+    description: >-
+      The version to tag, without a bump, when the repository
+      has no version tag yet.
     required: true
   source-paths:
-    description: Space-separated paths that hold the package's Swift sources.
-    required: false
     default: Sources
-  token:
-    description: Token with contents:write permission.
+    description: >-
+      The space-separated paths that hold the package's Swift
+      sources.
     required: false
+  token:
     default: ${{ github.token }}
+    description: A token with write access to the repository's contents.
+    required: false
 outputs:
   bump:
-    description: major, minor, patch, none, seed or tagged (already tagged, nothing done).
+    description: >-
+      The bump that was applied: `major`, `minor`, `patch`,
+      `none`, `seed`, or `tagged`.
     value: ${{ steps.result.outputs.bump }}
   version:
-    description: The version tagged by this run, without the v prefix (empty if none).
+    description: >-
+      The version that was tagged, without the `v` prefix, or an
+      empty string when nothing was tagged.
     value: ${{ steps.result.outputs.version }}
 runs:
   using: composite
@@ -32,22 +47,35 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
-        # Retire versions whose commits were rewritten away (squash, rebase, force push):
-        # every v* tag above the nearest reachable one whose commit is no longer an ancestor of HEAD.
+
+        is_newer() {
+          [ "$1" != "$2" ] \
+            && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+        }
+
+        prev=$(
+          git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null \
+            || true
+        )
+
         floor=""
-        for t in $(git tag -l 'v[0-9]*' | sort -V); do
-          git merge-base --is-ancestor "$t" HEAD && continue
-          if [ -n "$prev" ] && [ "$(printf '%s\n%s\n' "$prev" "$t" | sort -V | tail -n1)" = "$prev" ]; then
-            continue  # older than the surviving history; leave it alone
-          fi
-          echo "Retiring $t: its commit is no longer on this branch."
-          gh release delete "$t" --yes --cleanup-tag || git push origin --delete "$t"
-          git tag -d "$t" >/dev/null
-          floor="$t"
+
+        # Retire versions whose commits were rewritten away.
+        for tag in $(git tag -l 'v[0-9]*' | sort -V); do
+          git merge-base --is-ancestor "$tag" HEAD && continue
+          is_newer "$prev" "$tag" && continue
+
+          echo "Retiring $tag: its commit is no longer on this branch."
+          gh release delete "$tag" --yes --cleanup-tag \
+            || git push origin --delete "$tag"
+          git tag -d "$tag" >/dev/null
+          floor="$tag"
         done
+
         echo "floor=$floor" >> "$GITHUB_OUTPUT"
-        if git describe --tags --exact-match --match 'v[0-9]*' HEAD >/dev/null 2>&1; then
+
+        if git describe --tags --exact-match --match 'v[0-9]*' HEAD \
+            >/dev/null 2>&1; then
           echo "HEAD is already tagged; nothing to do."
           echo "state=tagged" >> "$GITHUB_OUTPUT"
         elif [ -n "$prev" ]; then
@@ -55,7 +83,7 @@ runs:
           echo "state=bump" >> "$GITHUB_OUTPUT"
           echo "tag=$prev" >> "$GITHUB_OUTPUT"
         else
-          echo "No v* tag reachable from HEAD; will seed."
+          echo "No version tag reachable from HEAD; seeding."
           echo "state=seed" >> "$GITHUB_OUTPUT"
         fi
 
@@ -64,90 +92,145 @@ runs:
       if: steps.prev.outputs.state == 'bump'
       shell: bash
       env:
-        SCRIPTS: ${{ github.action_path }}/scripts
-        PREV: ${{ steps.prev.outputs.tag }}
         FLOOR: ${{ steps.prev.outputs.floor }}
+        PREV: ${{ steps.prev.outputs.tag }}
+        SCRIPTS: ${{ github.action_path }}/scripts
         SOURCE_PATHS: ${{ inputs.source-paths }}
       run: |
         set -euo pipefail
+
+        append_section() {
+          [ -s "$2" ] || return 0
+
+          echo
+          echo "### $1"
+          echo '```'
+          cat "$2"
+          echo '```'
+        }
+
+        count_lines() {
+          wc -l < "$1"
+        }
+
+        platform_pattern='^[-+].*(swift-tools-version|\.(iOS|macOS|tvOS|visionOS|watchOS)\()'
         work="$RUNNER_TEMP/release"
         mkdir -p "$work"
+
         # shellcheck disable=SC2086
-        python3 -I "$SCRIPTS/public_api.py" . "$PREV" $SOURCE_PATHS > "$work/api_before.txt"
+        python3 "$SCRIPTS/public_api.py" . "$PREV" $SOURCE_PATHS \
+          > "$work/api_before.txt"
+
         # shellcheck disable=SC2086
-        python3 -I "$SCRIPTS/public_api.py" . HEAD    $SOURCE_PATHS > "$work/api_after.txt"
-        python3 -I "$SCRIPTS/api_diff.py" "$work/api_before.txt" "$work/api_after.txt" --out-dir "$work"
-        removed=$(wc -l < "$work/api_removed.txt")
-        added=$(( $(wc -l < "$work/api_added.txt") + $(wc -l < "$work/api_extended.txt") ))
-        # shellcheck disable=SC2086
-        lines=$(git diff --numstat "$PREV" HEAD -- $SOURCE_PATHS Package.swift | awk '{a+=$1; d+=$2} END {print a+d+0}')
+        python3 "$SCRIPTS/public_api.py" . HEAD $SOURCE_PATHS \
+          > "$work/api_after.txt"
+
+        python3 "$SCRIPTS/api_diff.py" \
+          "$work/api_before.txt" \
+          "$work/api_after.txt" \
+          --out-dir "$work"
+
+        added=$(count_lines "$work/api_added.txt")
+        extended=$(count_lines "$work/api_extended.txt")
+        removed=$(count_lines "$work/api_removed.txt")
         platform=0
-        if git diff "$PREV" HEAD -- Package.swift | grep -Eq '^[-+].*(swift-tools-version|\.iOS\(|\.macOS\(|\.tvOS\(|\.watchOS\(|\.visionOS\()'; then
+
+        if git diff "$PREV" HEAD -- Package.swift \
+            | grep -Eq "$platform_pattern"; then
           platform=1
         fi
-        messages=$(git log --format=%B "$PREV"..HEAD)
-        python3 -I "$SCRIPTS/decide_bump.py" \
-          --prev "$PREV" --floor "$FLOOR" --removed "$removed" --added "$added" \
-          --lines "$lines" --platform-changed "$platform" --messages "$messages" \
+
+        lines=$(
+          # shellcheck disable=SC2086
+          git diff --numstat "$PREV" HEAD -- $SOURCE_PATHS Package.swift \
+            | awk '{ total += $1 + $2 } END { print total + 0 }'
+        )
+
+        python3 "$SCRIPTS/decide_bump.py" \
+          --added "$((added + extended))" \
+          --floor "$FLOOR" \
+          --lines "$lines" \
+          --messages "$(git log --format=%B "$PREV"..HEAD)" \
+          --platform-changed "$platform" \
+          --prev "$PREV" \
+          --removed "$removed" \
           | tee -a "$GITHUB_OUTPUT"
+
         {
           echo "Changes since $PREV: $lines line(s) in $SOURCE_PATHS and Package.swift."
-          if [ -s "$work/api_removed.txt" ]; then
-            echo; echo "### Public API removed or changed"; echo '```'; cat "$work/api_removed.txt"; echo '```'
-          fi
-          if [ -s "$work/api_added.txt" ]; then
-            echo; echo "### Public API added"; echo '```'; cat "$work/api_added.txt"; echo '```'
-          fi
-          if [ -s "$work/api_extended.txt" ]; then
-            echo; echo "### Public API extended (new defaulted parameters)"; echo '```'; cat "$work/api_extended.txt"; echo '```'
-          fi
+          append_section "Public API removed or changed" "$work/api_removed.txt"
+          append_section "Public API added" "$work/api_added.txt"
+          append_section "Public API extended (new defaulted parameters)" \
+            "$work/api_extended.txt"
         } > "$work/release_notes.md"
 
     - name: Tag and release
       if: steps.prev.outputs.state == 'bump' && steps.bump.outputs.bump != 'none'
       shell: bash
       env:
+        BUMP: ${{ steps.bump.outputs.bump }}
         GH_TOKEN: ${{ inputs.token }}
         NEW: v${{ steps.bump.outputs.version }}
-        BUMP: ${{ steps.bump.outputs.bump }}
       run: |
         set -euo pipefail
+
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git tag -a "$NEW" -m "$NEW ($BUMP bump)"
         git push origin "$NEW"
-        gh release create "$NEW" --verify-tag --title "$NEW" --generate-notes --notes-file "$RUNNER_TEMP/release/release_notes.md"
+        gh release create "$NEW" \
+          --generate-notes \
+          --notes-file "$RUNNER_TEMP/release/release_notes.md" \
+          --title "$NEW" \
+          --verify-tag
 
     - name: Seed first version
       id: seed
       if: steps.prev.outputs.state == 'seed'
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.token }}
-        SCRIPTS: ${{ github.action_path }}/scripts
-        INITIAL: ${{ inputs.initial-version }}
         FLOOR: ${{ steps.prev.outputs.floor }}
+        GH_TOKEN: ${{ inputs.token }}
+        INITIAL: ${{ inputs.initial-version }}
+        SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -euo pipefail
-        python3 -I "$SCRIPTS/decide_bump.py" --seed "$INITIAL" --floor "$FLOOR" | tee -a "$GITHUB_OUTPUT"
-        NEW="v$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -n1)"
+
+        python3 "$SCRIPTS/decide_bump.py" \
+          --floor "$FLOOR" \
+          --seed "$INITIAL" \
+          | tee -a "$GITHUB_OUTPUT"
+
+        new="v$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -n1)"
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git tag -a "$NEW" -m "$NEW (initial version)"
-        git push origin "$NEW"
-        gh release create "$NEW" --verify-tag --title "$NEW" --notes "Initial semantic version. Earlier history is unversioned."
+        git tag -a "$new" -m "$new (initial version)"
+        git push origin "$new"
+        gh release create "$new" \
+          --notes "Initial semantic version. Earlier history is unversioned." \
+          --title "$new" \
+          --verify-tag
 
     - name: Result
       id: result
       shell: bash
       env:
-        STATE: ${{ steps.prev.outputs.state }}
         BUMP: ${{ steps.bump.outputs.bump }}
-        VERSION: ${{ steps.bump.outputs.version }}
         SEEDED: ${{ steps.seed.outputs.version }}
+        STATE: ${{ steps.prev.outputs.state }}
+        VERSION: ${{ steps.bump.outputs.version }}
       run: |
         case "$STATE" in
-          seed)   echo "bump=seed" >> "$GITHUB_OUTPUT"; echo "version=$SEEDED" >> "$GITHUB_OUTPUT" ;;
-          tagged) echo "bump=tagged" >> "$GITHUB_OUTPUT"; echo "version=" >> "$GITHUB_OUTPUT" ;;
-          *)      echo "bump=$BUMP" >> "$GITHUB_OUTPUT"; echo "version=$VERSION" >> "$GITHUB_OUTPUT" ;;
+          seed)
+            echo "bump=seed" >> "$GITHUB_OUTPUT"
+            echo "version=$SEEDED" >> "$GITHUB_OUTPUT"
+            ;;
+          tagged)
+            echo "bump=tagged" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            ;;
         esac
