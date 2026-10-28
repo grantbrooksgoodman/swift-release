@@ -1,0 +1,130 @@
+name: Swift package release
+description: >-
+  Mint a semantic-version tag and a GitHub release for a push to the default
+  branch. The bump is decided from the package's public API diff since the
+  previous tag (see README.md for the rules and the override tokens).
+inputs:
+  initial-version:
+    description: Version to tag as-is (no bump) when the repository has no v* tag yet.
+    required: true
+  source-paths:
+    description: Space-separated paths that hold the package's Swift sources.
+    required: false
+    default: Sources
+  token:
+    description: Token with contents:write permission.
+    required: false
+    default: ${{ github.token }}
+outputs:
+  bump:
+    description: major, minor, patch, none, seed or tagged (already tagged, nothing done).
+    value: ${{ steps.result.outputs.bump }}
+  version:
+    description: The version tagged by this run, without the v prefix (empty if none).
+    value: ${{ steps.result.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Find previous version
+      id: prev
+      shell: bash
+      run: |
+        set -euo pipefail
+        if git describe --tags --exact-match --match 'v[0-9]*' HEAD >/dev/null 2>&1; then
+          echo "HEAD is already tagged; nothing to do."
+          echo "state=tagged" >> "$GITHUB_OUTPUT"
+        elif tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null); then
+          echo "Previous version: $tag"
+          echo "state=bump" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        else
+          echo "No v* tag yet; will seed v${{ inputs.initial-version }}."
+          echo "state=seed" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Decide bump
+      id: bump
+      if: steps.prev.outputs.state == 'bump'
+      shell: bash
+      env:
+        SCRIPTS: ${{ github.action_path }}/scripts
+        PREV: ${{ steps.prev.outputs.tag }}
+        SOURCE_PATHS: ${{ inputs.source-paths }}
+      run: |
+        set -euo pipefail
+        work="$RUNNER_TEMP/release"
+        mkdir -p "$work"
+        # shellcheck disable=SC2086
+        python3 -I "$SCRIPTS/public_api.py" . "$PREV" $SOURCE_PATHS > "$work/api_before.txt"
+        # shellcheck disable=SC2086
+        python3 -I "$SCRIPTS/public_api.py" . HEAD    $SOURCE_PATHS > "$work/api_after.txt"
+        python3 -I "$SCRIPTS/api_diff.py" "$work/api_before.txt" "$work/api_after.txt" --out-dir "$work"
+        removed=$(wc -l < "$work/api_removed.txt")
+        added=$(( $(wc -l < "$work/api_added.txt") + $(wc -l < "$work/api_extended.txt") ))
+        # shellcheck disable=SC2086
+        lines=$(git diff --numstat "$PREV" HEAD -- $SOURCE_PATHS Package.swift | awk '{a+=$1; d+=$2} END {print a+d+0}')
+        platform=0
+        if git diff "$PREV" HEAD -- Package.swift | grep -Eq '^[-+].*(swift-tools-version|\.iOS\(|\.macOS\(|\.tvOS\(|\.watchOS\(|\.visionOS\()'; then
+          platform=1
+        fi
+        messages=$(git log --format=%B "$PREV"..HEAD)
+        python3 -I "$SCRIPTS/decide_bump.py" \
+          --prev "$PREV" --removed "$removed" --added "$added" \
+          --lines "$lines" --platform-changed "$platform" --messages "$messages" \
+          | tee -a "$GITHUB_OUTPUT"
+        {
+          echo "Changes since $PREV: $lines line(s) in $SOURCE_PATHS and Package.swift."
+          if [ -s "$work/api_removed.txt" ]; then
+            echo; echo "### Public API removed or changed"; echo '```'; cat "$work/api_removed.txt"; echo '```'
+          fi
+          if [ -s "$work/api_added.txt" ]; then
+            echo; echo "### Public API added"; echo '```'; cat "$work/api_added.txt"; echo '```'
+          fi
+          if [ -s "$work/api_extended.txt" ]; then
+            echo; echo "### Public API extended (new defaulted parameters)"; echo '```'; cat "$work/api_extended.txt"; echo '```'
+          fi
+        } > "$work/release_notes.md"
+
+    - name: Tag and release
+      if: steps.prev.outputs.state == 'bump' && steps.bump.outputs.bump != 'none'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        NEW: v${{ steps.bump.outputs.version }}
+        BUMP: ${{ steps.bump.outputs.bump }}
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git tag -a "$NEW" -m "$NEW ($BUMP bump)"
+        git push origin "$NEW"
+        gh release create "$NEW" --verify-tag --title "$NEW" --generate-notes --notes-file "$RUNNER_TEMP/release/release_notes.md"
+
+    - name: Seed first version
+      if: steps.prev.outputs.state == 'seed'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        NEW: v${{ inputs.initial-version }}
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git tag -a "$NEW" -m "$NEW (initial version)"
+        git push origin "$NEW"
+        gh release create "$NEW" --verify-tag --title "$NEW" --notes "Initial semantic version. Earlier history is unversioned."
+
+    - name: Result
+      id: result
+      shell: bash
+      env:
+        STATE: ${{ steps.prev.outputs.state }}
+        BUMP: ${{ steps.bump.outputs.bump }}
+        VERSION: ${{ steps.bump.outputs.version }}
+        INITIAL: ${{ inputs.initial-version }}
+      run: |
+        case "$STATE" in
+          seed)   echo "bump=seed" >> "$GITHUB_OUTPUT"; echo "version=$INITIAL" >> "$GITHUB_OUTPUT" ;;
+          tagged) echo "bump=tagged" >> "$GITHUB_OUTPUT"; echo "version=" >> "$GITHUB_OUTPUT" ;;
+          *)      echo "bump=$BUMP" >> "$GITHUB_OUTPUT"; if [ "$BUMP" = none ]; then echo "version=" >> "$GITHUB_OUTPUT"; else echo "version=$VERSION" >> "$GITHUB_OUTPUT"; fi ;;
+        esac
