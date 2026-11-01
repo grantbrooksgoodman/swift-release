@@ -11,7 +11,7 @@ public API with the API at the previous tag and derives the
 bump from the difference, so a version number describes
 compatibility rather than effort.
 
-The action is designed for GitHub's `ubuntu-latest` runner,
+The action is designed for GitHub's `ubuntu-26.04` runner,
 which provides the `git`, `gh`, and `python3` tools that it
 uses. It does not require a Swift toolchain.
 
@@ -46,9 +46,9 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
