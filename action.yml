@@ -9,7 +9,9 @@ name: Swift package release
 description: >-
   Mints a semantic version tag and a GitHub release for every
   push to a Swift package's default branch. The bump is derived
-  from the package's public API diff since the previous tag.
+  from the package's public API diff since the previous tag, and
+  the tagged commit pins the package's own dependencies to their
+  latest versions.
 inputs:
   initial-version:
     description: >-
@@ -48,21 +50,51 @@ runs:
       run: |
         set -euo pipefail
 
+        # Prints the commit on this branch that a tag describes: the
+        # tag's own commit, or its parent when the tag names a release
+        # commit. Prints nothing when the tag describes no commit on
+        # this branch.
+        base_of() {
+          local commit parent
+          commit=$(git rev-parse "$1^{commit}")
+
+          if git merge-base --is-ancestor "$commit" HEAD; then
+            echo "$commit"
+            return 0
+          fi
+
+          parent=$(git rev-parse --verify --quiet "$commit^" || true)
+
+          if [ -n "$parent" ] \
+              && git merge-base --is-ancestor "$parent" HEAD; then
+            echo "$parent"
+          fi
+        }
+
         is_newer() {
           [ "$1" != "$2" ] \
             && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
         }
 
-        prev=$(
-          git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null \
-            || true
-        )
+        base=""
+        orphaned=""
+        prev=""
+
+        for tag in $(git tag -l 'v[0-9]*' | sort -V); do
+          tag_base=$(base_of "$tag")
+
+          if [ -n "$tag_base" ]; then
+            base="$tag_base"
+            prev="$tag"
+          else
+            orphaned="$orphaned $tag"
+          fi
+        done
 
         floor=""
 
         # Retire versions whose commits were rewritten away.
-        for tag in $(git tag -l 'v[0-9]*' | sort -V); do
-          git merge-base --is-ancestor "$tag" HEAD && continue
+        for tag in $orphaned; do
           is_newer "$prev" "$tag" && continue
 
           echo "Retiring $tag: its commit is no longer on this branch."
@@ -72,18 +104,19 @@ runs:
           floor="$tag"
         done
 
+        echo "base=$base" >> "$GITHUB_OUTPUT"
         echo "floor=$floor" >> "$GITHUB_OUTPUT"
+        echo "tag=$prev" >> "$GITHUB_OUTPUT"
 
-        if git describe --tags --exact-match --match 'v[0-9]*' HEAD \
-            >/dev/null 2>&1; then
-          echo "HEAD is already tagged; nothing to do."
+        if [ -n "$base" ] \
+            && [ "$base" = "$(git rev-parse HEAD)" ]; then
+          echo "HEAD is already released as $prev; nothing to do."
           echo "state=tagged" >> "$GITHUB_OUTPUT"
         elif [ -n "$prev" ]; then
           echo "Previous version: $prev"
           echo "state=bump" >> "$GITHUB_OUTPUT"
-          echo "tag=$prev" >> "$GITHUB_OUTPUT"
         else
-          echo "No version tag reachable from HEAD; seeding."
+          echo "No version tag describes this branch; seeding."
           echo "state=seed" >> "$GITHUB_OUTPUT"
         fi
 
@@ -92,22 +125,13 @@ runs:
       if: steps.prev.outputs.state == 'bump'
       shell: bash
       env:
+        BASE: ${{ steps.prev.outputs.base }}
         FLOOR: ${{ steps.prev.outputs.floor }}
         PREV: ${{ steps.prev.outputs.tag }}
         SCRIPTS: ${{ github.action_path }}/scripts
         SOURCE_PATHS: ${{ inputs.source-paths }}
       run: |
         set -euo pipefail
-
-        append_section() {
-          [ -s "$2" ] || return 0
-
-          echo
-          echo "### $1"
-          echo '```'
-          cat "$2"
-          echo '```'
-        }
 
         count_lines() {
           wc -l < "$1"
@@ -118,7 +142,7 @@ runs:
         mkdir -p "$work"
 
         # shellcheck disable=SC2086
-        python3 "$SCRIPTS/public_api.py" . "$PREV" $SOURCE_PATHS \
+        python3 "$SCRIPTS/public_api.py" . "$BASE" $SOURCE_PATHS \
           > "$work/api_before.txt"
 
         # shellcheck disable=SC2086
@@ -135,14 +159,14 @@ runs:
         removed=$(count_lines "$work/api_removed.txt")
         platform=0
 
-        if git diff "$PREV" HEAD -- Package.swift \
+        if git diff "$BASE" HEAD -- Package.swift \
             | grep -Eq "$platform_pattern"; then
           platform=1
         fi
 
         lines=$(
           # shellcheck disable=SC2086
-          git diff --numstat "$PREV" HEAD -- $SOURCE_PATHS Package.swift \
+          git diff --numstat "$BASE" HEAD -- $SOURCE_PATHS Package.swift \
             | awk '{ total += $1 + $2 } END { print total + 0 }'
         )
 
@@ -150,81 +174,106 @@ runs:
           --added "$((added + extended))" \
           --floor "$FLOOR" \
           --lines "$lines" \
-          --messages "$(git log --format=%B "$PREV"..HEAD)" \
+          --messages "$(git log --format=%B "$BASE"..HEAD)" \
           --platform-changed "$platform" \
           --prev "$PREV" \
           --removed "$removed" \
           | tee -a "$GITHUB_OUTPUT"
 
-        {
-          echo "Changes since $PREV: $lines line(s) in $SOURCE_PATHS and Package.swift."
-          append_section "Public API removed or changed" "$work/api_removed.txt"
-          append_section "Public API added" "$work/api_added.txt"
-          append_section "Public API extended (new defaulted parameters)" \
-            "$work/api_extended.txt"
-        } > "$work/release_notes.md"
+        echo "Changes since $PREV: $lines line(s) in $SOURCE_PATHS and Package.swift." \
+          > "$work/summary.md"
 
-    - name: Tag and release
-      if: steps.prev.outputs.state == 'bump' && steps.bump.outputs.bump != 'none'
-      shell: bash
-      env:
-        BUMP: ${{ steps.bump.outputs.bump }}
-        GH_TOKEN: ${{ inputs.token }}
-        NEW: v${{ steps.bump.outputs.version }}
-      run: |
-        set -euo pipefail
-
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git tag -a "$NEW" -m "$NEW ($BUMP bump)"
-        git push origin "$NEW"
-        gh release create "$NEW" \
-          --generate-notes \
-          --notes-file "$RUNNER_TEMP/release/release_notes.md" \
-          --title "$NEW" \
-          --verify-tag
-
-    - name: Seed first version
+    - name: Decide seed version
       id: seed
       if: steps.prev.outputs.state == 'seed'
       shell: bash
       env:
         FLOOR: ${{ steps.prev.outputs.floor }}
-        GH_TOKEN: ${{ inputs.token }}
         INITIAL: ${{ inputs.initial-version }}
         SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -euo pipefail
+
+        work="$RUNNER_TEMP/release"
+        mkdir -p "$work"
 
         python3 "$SCRIPTS/decide_bump.py" \
           --floor "$FLOOR" \
           --seed "$INITIAL" \
           | tee -a "$GITHUB_OUTPUT"
 
-        new="v$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -n1)"
+        echo "Initial semantic version. Earlier history is unversioned." \
+          > "$work/summary.md"
+
+    - name: Tag and release
+      id: release
+      if: steps.prev.outputs.state != 'tagged' && steps.bump.outputs.bump != 'none'
+      shell: bash
+      env:
+        BUMP: ${{ steps.bump.outputs.bump || 'seed' }}
+        GH_TOKEN: ${{ inputs.token }}
+        OWNER: ${{ github.repository_owner }}
+        SCRIPTS: ${{ github.action_path }}/scripts
+        VERSION: ${{ steps.bump.outputs.version || steps.seed.outputs.version }}
+      run: |
+        set -euo pipefail
+
+        append_section() {
+          [ -s "$2" ] || return 0
+
+          echo
+          echo "### $1"
+          echo '```'
+          cat "$2"
+          echo '```'
+        }
+
+        new="v$VERSION"
+        work="$RUNNER_TEMP/release"
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git tag -a "$new" -m "$new (initial version)"
+        : > "$work/dependencies.txt"
+
+        if [ -f Package.swift ]; then
+          python3 "$SCRIPTS/pin_dependencies.py" --owner "$OWNER" Package.swift \
+            > "$work/dependencies.txt"
+        fi
+
+        # A release commit carries the pinned manifest and is reachable
+        # only through its tag; the branch itself stays unchanged.
+        if ! git diff --quiet -- Package.swift; then
+          git checkout --quiet --detach
+          git commit --quiet --all --message "Pin dependencies for $new"
+        fi
+
+        {
+          cat "$work/summary.md"
+          append_section "Public API removed or changed" "$work/api_removed.txt"
+          append_section "Public API added" "$work/api_added.txt"
+          append_section "Public API extended (new defaulted parameters)" \
+            "$work/api_extended.txt"
+          append_section "Dependencies" "$work/dependencies.txt"
+        } > "$work/release_notes.md"
+
+        git tag -a "$new" -m "$new ($BUMP)"
         git push origin "$new"
         gh release create "$new" \
-          --notes "Initial semantic version. Earlier history is unversioned." \
+          --generate-notes \
+          --notes-file "$work/release_notes.md" \
           --title "$new" \
           --verify-tag
+
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
     - name: Result
       id: result
       shell: bash
       env:
-        BUMP: ${{ steps.bump.outputs.bump }}
-        SEEDED: ${{ steps.seed.outputs.version }}
+        BUMP: ${{ steps.bump.outputs.bump || 'seed' }}
         STATE: ${{ steps.prev.outputs.state }}
-        VERSION: ${{ steps.bump.outputs.version }}
+        VERSION: ${{ steps.release.outputs.version }}
       run: |
         case "$STATE" in
-          seed)
-            echo "bump=seed" >> "$GITHUB_OUTPUT"
-            echo "version=$SEEDED" >> "$GITHUB_OUTPUT"
-            ;;
           tagged)
             echo "bump=tagged" >> "$GITHUB_OUTPUT"
             echo "version=" >> "$GITHUB_OUTPUT"

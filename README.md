@@ -9,7 +9,9 @@ Use `swift-release` to version a Swift package without editing
 version numbers by hand. The action compares the package's
 public API with the API at the previous tag and derives the
 bump from the difference, so a version number describes
-compatibility rather than effort.
+compatibility rather than effort. The tagged commit pins the
+package's own dependencies to their latest versions, while the
+branch itself keeps following their default branches.
 
 The action is designed for GitHub's `ubuntu-26.04` runner,
 which provides the `git`, `gh`, and `python3` tools that it
@@ -57,11 +59,11 @@ jobs:
           initial-version: "1.0.0"
 ```
 
-The first push with the workflow in place tags the pushed
-commit with `initial-version`. Every later push compares the
-pushed commit with the newest version tag reachable from it and
-mints the next version. A push that lands on an already tagged
-commit does nothing.
+The first push with the workflow in place releases the pushed
+commit as `initial-version`. Every later push compares the
+pushed commit with the branch commit of the newest version tag
+and mints the next version. A push that lands on an already
+released commit does nothing.
 
 ## How the bump is chosen
 
@@ -92,15 +94,53 @@ The action applies the first rule that matches:
 > to override the result, or delete the tag and the release and
 > run the workflow again.
 
+## Release commits
+
+Swift Package Manager resolves a package that is required by
+version only if the manifest at that version requires every
+dependency by version too. A manifest on the default branch
+that requires sibling packages by branch therefore cannot be
+tagged as it is.
+
+The action resolves this with a release commit. Before tagging,
+it rewrites every `.package(url:branch:)` entry whose URL
+belongs to the repository's owner so that it requires the
+dependency's latest version tag with `exact:`, commits the
+result as a child of the pushed commit, and tags that child.
+Only the tag is pushed; the default branch is unchanged and
+keeps requiring its siblings by branch. Dependencies owned by
+other accounts, and dependencies that already use a version
+requirement, are left as they are. A package without any
+branch-based sibling is tagged on the pushed commit itself.
+
+Consumers can then choose per package. A `from:` requirement
+yields a fully versioned graph. A `branch:` requirement yields
+the development graph. The two can be mixed in one consumer,
+because Swift Package Manager lets a branch requirement
+override a version requirement for the same package: an app
+that requires AppSubsystem by version and adds AlertKit by
+branch resolves AlertKit, and everything AlertKit requires by
+branch, to those branches. A branch requirement wins wherever
+it appears in the graph, so a `branch:` on one package can pull
+another package to its branch even when the app asked for that
+package by version.
+
+> Important: Release dependencies leaves first. A sibling that
+> has no version tag yet is left on its branch, is listed as
+> `unpinned` in the release notes, and makes the release
+> unusable by version until the sibling is released and the
+> package is released again. The runner must also be able to
+> read every sibling's repository.
+
 ## History rewrites
 
 Squashing, rebasing, or force-pushing the default branch is
-supported. On the next run, every version whose commit is no
-longer on the branch is retired: its GitHub release and tag are
-deleted. The rewritten head then receives a fresh version that
-is higher than every retired version, so numbers never go
-backwards and are never reused. Gaps can appear, for example
-`v31.0.0` followed by `v31.0.3`.
+supported. On the next run, every version whose branch commit
+is no longer on the branch is retired: its GitHub release and
+tag are deleted. The rewritten head then receives a fresh
+version that is higher than every retired version, so numbers
+never go backwards and are never reused. Gaps can appear, for
+example `v31.0.0` followed by `v31.0.3`.
 
 A commit, push, squash, and force-push sequence triggers two
 runs. Any version that the first run mints on the commit before
@@ -109,6 +149,16 @@ squashed commit.
 
 > Note: If a consumer has already resolved a retired version,
 > run package resolution again.
+
+## Release notes
+
+Every release lists the number of changed lines in the source
+paths and `Package.swift` since the previous version, followed
+by the public API that was removed or changed, added, or
+extended with new defaulted parameters, and by the versions
+that the release commit pins. A section with nothing to report
+is omitted. GitHub's generated notes, which end with a compare
+link, follow.
 
 ## Inputs
 
@@ -132,6 +182,7 @@ squashed commit.
 | `action.yml` | The composite action. |
 | `scripts/api_diff.py` | Compares two API listings and reports removed, added, and extended declarations. |
 | `scripts/decide_bump.py` | Applies the rules above and prints the bump and the next version. |
+| `scripts/pin_dependencies.py` | Rewrites a manifest so that owned branch-based dependencies require their latest versions. |
 | `scripts/public_api.py` | Prints the public API listing of a package at a git revision. |
 | `scripts/swift_declarations.py` | Scans Swift source text for declarations. |
 | `scripts/swift_lexing.py` | Removes comments and string literals from Swift source text. |
