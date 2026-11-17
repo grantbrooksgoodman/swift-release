@@ -62,6 +62,10 @@ SETTER_MODIFIERS = (
     "package(set)",
     "private(set)"
 )
+TRAILING_COMMA_CLOSINGS = (
+    ")",
+    "]"
+)
 WHITESPACE_PATTERN = re.compile(r"\s+")
 
 def _has_open_bracket(text: str) -> bool:
@@ -137,10 +141,10 @@ def normalized(
     Returns the canonical text for a declaration.
 
     The result collapses whitespace, removes the spaces around
-    punctuation, and drops access modifiers. An `open`
-    declaration is prefixed with `open`, and a declaration whose
-    setter is less visible than its getter is prefixed with
-    `readonly`.
+    punctuation, drops trailing commas before a closing bracket,
+    and drops access modifiers. An `open` declaration is prefixed
+    with `open`, and a declaration whose setter is less visible
+    than its getter is prefixed with `readonly`.
 
     - Parameters:
       - pending_attributes: Attributes written on the lines
@@ -173,6 +177,12 @@ def normalized(
             ])
         ).strip()
     )
+
+    for closing in TRAILING_COMMA_CLOSINGS:
+        text = text.replace(
+            "," + closing,
+            closing
+        )
 
     if any(modifier.startswith(SETTER_MODIFIERS) for modifier in modifiers):
         text = "readonly " + text

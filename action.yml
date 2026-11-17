@@ -66,9 +66,18 @@ runs:
           parent=$(git rev-parse --verify --quiet "$commit^" || true)
 
           if [ -n "$parent" ] \
+              && is_release_commit "$commit" "$1" \
               && git merge-base --is-ancestor "$parent" HEAD; then
             echo "$parent"
           fi
+        }
+
+        # A release commit is one the action made for the tag: it
+        # carries the tag's pin message and changes nothing but the
+        # manifest.
+        is_release_commit() {
+          [ "$(git log -1 --format=%s "$1")" = "Pin dependencies for $2" ] \
+            && git diff --quiet "$1^" "$1" -- . ':!Package.swift'
         }
 
         is_newer() {
